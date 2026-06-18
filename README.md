@@ -1,9 +1,14 @@
 # RayDer
+[![Conference](https://img.shields.io/badge/ECCV-2026-4b2e83)](https://compvis.github.io/rayder/)
 [![Project Page](https://img.shields.io/badge/Project-Page-blue)](https://compvis.github.io/rayder/)
 [![Paper](https://img.shields.io/badge/arXiv-paper-b31b1b)](https://arxiv.org/abs/2605.31535)
 [![Weights](https://img.shields.io/badge/HuggingFace-Weights-orange)](https://huggingface.co/CompVis/rayder)
 
 <h2 align="center">Scalable Self-Supervised Novel View Synthesis from Real-World Video</h2>
+
+<p align="center">
+  <b>ECCV 2026</b>
+</p>
 
 <div align="center">
   <a href="https://scholar.google.com/citations?user=-kkLqx0AAAAJ&hl=en" target="_blank">Ulrich Prestel</a><sup>*</sup> &middot;
