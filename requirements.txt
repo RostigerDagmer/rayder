@@ -1,8 +1,11 @@
 torch
 torchvision
+lpips
 einops
 jaxtyping
 Pillow
 imageio
 imageio-ffmpeg
 gradio
+huggingface_hub
+datasets

@@ -169,15 +169,26 @@ def _rms_norm(
 
 
 class AdaRMSNorm(nn.Module):
-    def __init__(self, features: int, cond_features: int) -> None:
+    def __init__(self, features: int, cond_features: int, light_features: int | None = None) -> None:
         super().__init__()
         self.linear = nn.Linear(cond_features, features, bias=False)
         nn.init.zeros_(self.linear.weight)
+        self.light_linear = None if light_features is None else nn.Linear(light_features, features, bias=False)
+        if self.light_linear is not None:
+            nn.init.zeros_(self.light_linear.weight)
 
     def forward(
-        self, x: Float[torch.Tensor, "... d"], cond: Float[torch.Tensor, "... d_cond"]
+        self,
+        x: Float[torch.Tensor, "... d"],
+        cond: Float[torch.Tensor, "... d_cond"],
+        light_cond: Float[torch.Tensor, "... d_light"] | None = None,
     ) -> Float[torch.Tensor, "... d"]:
-        return _rms_norm(x, self.linear(cond) + 1, 1e-6)
+        scale = self.linear(cond)
+        if light_cond is not None:
+            if self.light_linear is None:
+                raise ValueError("This AdaRMSNorm was constructed without lighting conditioning.")
+            scale = scale + self.light_linear(light_cond)
+        return _rms_norm(x, scale + 1, 1e-6)
 
 
 class RMSNorm(nn.Module):
@@ -200,18 +211,21 @@ class LinearSwiGLU(nn.Linear):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, d_model: int, d_cond: int) -> None:
+    def __init__(self, d_model: int, d_cond: int, d_light: int | None = None) -> None:
         super().__init__()
         d_ff = d_model * FF_EXPAND
-        self.norm = AdaRMSNorm(d_model, d_cond)
+        self.norm = AdaRMSNorm(d_model, d_cond, d_light)
         self.up_proj = LinearSwiGLU(d_model, d_ff)
         self.down_proj = nn.Linear(d_ff, d_model, bias=False)
         nn.init.zeros_(self.down_proj.weight)
 
     def forward(
-        self, x: Float[torch.Tensor, "b ... d"], cond_norm: Float[torch.Tensor, "b ... d_cond"]
+        self,
+        x: Float[torch.Tensor, "b ... d"],
+        cond_norm: Float[torch.Tensor, "b ... d_cond"],
+        light_cond: Float[torch.Tensor, "b ... d_light"] | None = None,
     ) -> Float[torch.Tensor, "b ... d"]:
-        return x + self.down_proj(self.up_proj(self.norm(x, cond_norm)))
+        return x + self.down_proj(self.up_proj(self.norm(x, cond_norm, light_cond)))
 
 
 class MLPHead(nn.Module):
@@ -267,6 +281,37 @@ def make_axial_pos_3d(t: int, h: int, w: int, dtype=None, device=None) -> Float[
     h_pos = centers(y_min, y_max, h, dtype=dtype, device=device)
     w_pos = centers(x_min, x_max, w, dtype=dtype, device=device)
     return make_grid_3d(t_pos, h_pos, w_pos)
+
+
+@torch.compiler.disable
+def _prepare_temporal_ranks(
+    batch_size: int,
+    num_views: int,
+    device: torch.device,
+    temporal_ranks: Int[torch.Tensor, "... t"] | None,
+) -> Int[torch.Tensor, "b t"]:
+    """Return one permutation of temporal positional ranks per batch element."""
+    if temporal_ranks is None:
+        return torch.argsort(torch.rand(batch_size, num_views, device=device), dim=-1)
+
+    ranks = torch.as_tensor(temporal_ranks, device=device)
+    if ranks.dtype == torch.bool or ranks.is_floating_point() or ranks.is_complex():
+        raise TypeError("temporal_ranks must contain integers.")
+    if ranks.ndim == 1:
+        if ranks.shape != (num_views,):
+            raise ValueError(f"Expected temporal_ranks shape ({num_views},), got {tuple(ranks.shape)}.")
+        ranks = ranks.unsqueeze(0).expand(batch_size, -1)
+    elif ranks.shape != (batch_size, num_views):
+        raise ValueError(
+            f"Expected temporal_ranks shape ({num_views},) or ({batch_size}, {num_views}), "
+            f"got {tuple(ranks.shape)}."
+        )
+
+    ranks = ranks.to(dtype=torch.long)
+    expected = torch.arange(num_views, device=device).expand(batch_size, -1)
+    if not torch.equal(torch.sort(ranks, dim=-1).values, expected):
+        raise ValueError(f"Every temporal_ranks row must be a permutation of [0, {num_views - 1}].")
+    return ranks
 
 
 def scale_for_cosine_sim(
@@ -334,11 +379,11 @@ class AxialRoPE3D(nn.Module):
 
 
 class NeighborhoodAttention(nn.Module):
-    def __init__(self, d_model: int, d_cond: int) -> None:
+    def __init__(self, d_model: int, d_cond: int, d_light: int | None = None) -> None:
         super().__init__()
         n_heads = d_model // D_HEAD
         self.n_heads = n_heads
-        self.norm = AdaRMSNorm(d_model, d_cond)
+        self.norm = AdaRMSNorm(d_model, d_cond, d_light)
         self.qkv_proj = nn.Linear(d_model, d_model * 3, bias=False)
         self.scale = nn.Parameter(torch.full([n_heads], 10.0))
         self.pos_emb = AxialRoPE3D(D_HEAD, n_heads)
@@ -383,10 +428,11 @@ class NeighborhoodAttention(nn.Module):
         x: Float[torch.Tensor, "b ... d"],
         pos: Float[torch.Tensor, "b ... 3"],
         cond_norm: Float[torch.Tensor, "b ... d_cond"],
+        light_cond: Float[torch.Tensor, "b ... d_light"] | None = None,
     ) -> Float[torch.Tensor, "b ... d"]:
         B, *DIMS, _ = x.shape
         skip = x
-        x = rearrange(self.norm(x, cond_norm), "b ... c -> b (...) c")
+        x = rearrange(self.norm(x, cond_norm, light_cond), "b ... c -> b (...) c")
         q, k, v = rearrange(self.qkv_proj(x), "n l (t h e) -> t n h l e", t=3, e=D_HEAD)
         q, k = scale_for_cosine_sim(q, k, self.scale[:, None, None], 1e-6)
         theta = self.pos_emb(rearrange(pos, "b ... c -> b (...) c")).movedim(-2, -3)
@@ -398,29 +444,30 @@ class NeighborhoodAttention(nn.Module):
 
 
 class NeighborhoodTransformerLayer(nn.Module):
-    def __init__(self, d_model: int, d_cond: int) -> None:
+    def __init__(self, d_model: int, d_cond: int, d_light: int | None = None) -> None:
         super().__init__()
-        self.self_attn = NeighborhoodAttention(d_model, d_cond)
-        self.ff = FeedForward(d_model, d_cond)
+        self.self_attn = NeighborhoodAttention(d_model, d_cond, d_light)
+        self.ff = FeedForward(d_model, d_cond, d_light)
 
     def forward(
         self,
         x: Float[torch.Tensor, "b ... d"],
         pos: Float[torch.Tensor, "b ... 3"],
         cond_norm: Float[torch.Tensor, "b ... d_cond"],
+        light_cond: Float[torch.Tensor, "b ... d_light"] | None = None,
     ) -> Float[torch.Tensor, "b ... d"]:
-        x = self.self_attn(x, pos, cond_norm)
-        x = self.ff(x, cond_norm)
+        x = self.self_attn(x, pos, cond_norm, light_cond)
+        x = self.ff(x, cond_norm, light_cond)
         return x
 
 
 class RegisterAttention(nn.Module):
-    def __init__(self, d_model: int, d_cond: int, use_rope: bool = True) -> None:
+    def __init__(self, d_model: int, d_cond: int, use_rope: bool = True, d_light: int | None = None) -> None:
         super().__init__()
         n_heads = d_model // D_HEAD
         self.n_heads = n_heads
-        self.norm = AdaRMSNorm(d_model, d_cond)
-        self.register_norm = AdaRMSNorm(d_model, d_cond)
+        self.norm = AdaRMSNorm(d_model, d_cond, d_light)
+        self.register_norm = AdaRMSNorm(d_model, d_cond, d_light)
         self.qkv_proj = nn.Linear(d_model, d_model * 3, bias=False)
         self.scale = nn.Parameter(torch.full([n_heads], 10.0))
         self.pos_emb = AxialRoPE3D(D_HEAD, n_heads) if use_rope else None
@@ -433,13 +480,15 @@ class RegisterAttention(nn.Module):
         registers: Float[torch.Tensor, "b n_r d"],
         cond_norm: Float[torch.Tensor, "b ... d_cond"],
         registers_cond_norm: Float[torch.Tensor, "b n_r d_cond"],
+        light_cond: Float[torch.Tensor, "b ... d_light"] | None = None,
+        registers_light_cond: Float[torch.Tensor, "b n_r d_light"] | None = None,
         pos: Float[torch.Tensor, "b ... c"] | None = None,
         registers_pos: Float[torch.Tensor, "b n_r c"] | None = None,
         block_mask: BlockMask | None = None,
     ) -> tuple[Float[torch.Tensor, "b ... d"], Float[torch.Tensor, "b n_r d"]]:
         skip, skip_r = x, registers
-        x = self.norm(x, cond_norm)
-        registers = self.register_norm(registers, registers_cond_norm)
+        x = self.norm(x, cond_norm, light_cond)
+        registers = self.register_norm(registers, registers_cond_norm, registers_light_cond)
         B, *DIMS, C = x.shape
         N_R = registers.shape[1]
         # qkv: [3, b, n_heads, l, d_head]
@@ -471,11 +520,11 @@ class RegisterAttention(nn.Module):
 
 
 class RegisterFeedForward(nn.Module):
-    def __init__(self, d_model: int, d_cond: int) -> None:
+    def __init__(self, d_model: int, d_cond: int, d_light: int | None = None) -> None:
         super().__init__()
         d_ff = d_model * FF_EXPAND
-        self.norm = AdaRMSNorm(d_model, d_cond)
-        self.register_norm = AdaRMSNorm(d_model, d_cond)
+        self.norm = AdaRMSNorm(d_model, d_cond, d_light)
+        self.register_norm = AdaRMSNorm(d_model, d_cond, d_light)
         self.up_proj = LinearSwiGLU(d_model, d_ff)
         self.down_proj = nn.Linear(d_ff, d_model, bias=False)
         nn.init.zeros_(self.down_proj.weight)
@@ -486,10 +535,12 @@ class RegisterFeedForward(nn.Module):
         registers: Float[torch.Tensor, "b n_r d"],
         cond_norm: Float[torch.Tensor, "b ... d_cond"],
         registers_cond_norm: Float[torch.Tensor, "b n_r d_cond"],
+        light_cond: Float[torch.Tensor, "b ... d_light"] | None = None,
+        registers_light_cond: Float[torch.Tensor, "b n_r d_light"] | None = None,
     ) -> tuple[Float[torch.Tensor, "b ... d"], Float[torch.Tensor, "b n_r d"]]:
         skip, skip_r = x, registers
-        x = self.norm(x, cond_norm)
-        registers = self.register_norm(registers, registers_cond_norm)
+        x = self.norm(x, cond_norm, light_cond)
+        registers = self.register_norm(registers, registers_cond_norm, registers_light_cond)
         B, *DIMS, C = x.shape
         N_R = registers.shape[1]
         x = self.down_proj(self.up_proj(torch.cat([rearrange(x, "b ... c -> b (...) c"), registers], dim=1)))
@@ -497,11 +548,11 @@ class RegisterFeedForward(nn.Module):
 
 
 class GlobalLocalTransformerLayer(nn.Module):
-    def __init__(self, d_model: int, d_cond: int) -> None:
+    def __init__(self, d_model: int, d_cond: int, d_light: int | None = None) -> None:
         super().__init__()
-        self.global_attn = RegisterAttention(d_model, d_cond, use_rope=False)
-        self.local_attn = RegisterAttention(d_model, d_cond, use_rope=True)
-        self.ff = RegisterFeedForward(d_model, d_cond)
+        self.global_attn = RegisterAttention(d_model, d_cond, use_rope=False, d_light=d_light)
+        self.local_attn = RegisterAttention(d_model, d_cond, use_rope=True, d_light=d_light)
+        self.ff = RegisterFeedForward(d_model, d_cond, d_light)
 
     def forward(
         self,
@@ -511,6 +562,8 @@ class GlobalLocalTransformerLayer(nn.Module):
         registers_pos: Float[torch.Tensor, "b t 3"],
         cond_norm: Float[torch.Tensor, "b t h w d_cond"],
         registers_cond_norm: Float[torch.Tensor, "b t d_cond"],
+        light_cond: Float[torch.Tensor, "b t h w d_light"] | None = None,
+        registers_light_cond: Float[torch.Tensor, "b t d_light"] | None = None,
         global_block_mask: BlockMask | None = None,
     ) -> tuple[Float[torch.Tensor, "b t h w d"], Float[torch.Tensor, "b t d"]]:
         B, T, H, W, _ = x.shape
@@ -520,6 +573,8 @@ class GlobalLocalTransformerLayer(nn.Module):
             block_mask=global_block_mask,
             cond_norm=cond_norm,
             registers_cond_norm=registers_cond_norm,
+            light_cond=light_cond,
+            registers_light_cond=registers_light_cond,
         )
         x_local, regs_local = self.local_attn(
             x=rearrange(x, "b t h w d -> (b t) h w d"),
@@ -528,10 +583,21 @@ class GlobalLocalTransformerLayer(nn.Module):
             registers_pos=rearrange(registers_pos, "b t c -> (b t) 1 c"),
             cond_norm=rearrange(cond_norm, "b t h w c -> (b t) h w c"),
             registers_cond_norm=rearrange(registers_cond_norm, "b t d -> (b t) 1 d"),
+            light_cond=None if light_cond is None else rearrange(light_cond, "b t h w c -> (b t) h w c"),
+            registers_light_cond=None
+            if registers_light_cond is None
+            else rearrange(registers_light_cond, "b t d -> (b t) 1 d"),
         )
         x = rearrange(x_local, "(b t) h w d -> b t h w d", b=B)
         registers = rearrange(regs_local, "(b t) 1 d -> b t d", b=B)
-        x, registers = self.ff(x=x, registers=registers, cond_norm=cond_norm, registers_cond_norm=registers_cond_norm)
+        x, registers = self.ff(
+            x=x,
+            registers=registers,
+            cond_norm=cond_norm,
+            registers_cond_norm=registers_cond_norm,
+            light_cond=light_cond,
+            registers_light_cond=registers_light_cond,
+        )
         return x, registers
 
 
@@ -613,6 +679,7 @@ class Backbone(nn.Module):
         d_cond: int,
         down_up_configs: list[tuple[int, int, tuple[int, int, int]]],
         main_patch_size: tuple[int, int, int],
+        d_light: int | None = None,
     ) -> None:
         super().__init__()
         configs = down_up_configs
@@ -622,19 +689,19 @@ class Backbone(nn.Module):
         prev_in = RGB_DIM + PLUECKER_DIM
         for w, d, ps in configs:
             self.merges.append(TokenMerge3D(prev_in, w, ps))
-            self.down_levels.append(nn.ModuleList([NeighborhoodTransformerLayer(w, d_cond) for _ in range(d)]))
+            self.down_levels.append(nn.ModuleList([NeighborhoodTransformerLayer(w, d_cond, d_light) for _ in range(d)]))
             prev_in = w
 
         prev_out = RGB_DIM
         self.splits = nn.ModuleList()
         self.up_levels = nn.ModuleList()
         for i, (w, d, ps) in enumerate(configs):
-            self.up_levels.append(nn.ModuleList([NeighborhoodTransformerLayer(w, d_cond) for _ in range(d)]))
+            self.up_levels.append(nn.ModuleList([NeighborhoodTransformerLayer(w, d_cond, d_light) for _ in range(d)]))
             self.splits.append(TokenSplitLast3D(w, prev_out, ps) if i == 0 else TokenSplit3D(w, prev_out, ps))
             prev_out = w
 
         self.mid_merge = TokenMerge3D(prev_in, width, main_patch_size)
-        self.mid_level = nn.ModuleList([GlobalLocalTransformerLayer(width, d_cond) for _ in range(depth)])
+        self.mid_level = nn.ModuleList([GlobalLocalTransformerLayer(width, d_cond, d_light) for _ in range(depth)])
         self.mid_split = TokenSplit3D(width, prev_out, main_patch_size)
 
     def forward(
@@ -645,6 +712,8 @@ class Backbone(nn.Module):
         registers_pos: Float[torch.Tensor, "b t 3"],
         cond_norm: Float[torch.Tensor, "b t h w d_cond"],
         registers_cond_norm: Float[torch.Tensor, "b t d_cond"],
+        light_cond: Float[torch.Tensor, "b t h w d_light"] | None = None,
+        registers_light_cond: Float[torch.Tensor, "b t d_light"] | None = None,
         global_block_mask: BlockMask | None = None,
     ) -> tuple[Float[torch.Tensor, "b t h w c_out"], Float[torch.Tensor, "b t d"]]:
         skips, poses = [], []
@@ -653,7 +722,7 @@ class Backbone(nn.Module):
             x, pos = merge(x, pos)
             poses.append(pos)
             for layer in level:
-                x = layer(x, pos=pos, cond_norm=cond_norm)
+                x = layer(x, pos=pos, cond_norm=cond_norm, light_cond=light_cond)
 
         skip_mid = x
         x, pos = self.mid_merge(x, pos)
@@ -666,12 +735,14 @@ class Backbone(nn.Module):
                 global_block_mask=global_block_mask,
                 cond_norm=cond_norm,
                 registers_cond_norm=registers_cond_norm,
+                light_cond=light_cond,
+                registers_light_cond=registers_light_cond,
             )
         x = self.mid_split(x, skip=skip_mid)
 
         for split, level, skip_down, pos_down in reversed(list(zip(self.splits, self.up_levels, skips, poses))):
             for layer in level:
-                x = layer(x, pos=pos_down, cond_norm=cond_norm)
+                x = layer(x, pos=pos_down, cond_norm=cond_norm, light_cond=light_cond)
             x = split(x, skip=skip_down) if isinstance(split, TokenSplit3D) else split(x)
 
         return x, registers
@@ -701,6 +772,7 @@ class RayDer(nn.Module):
         dynamic_state_dropout: float = 0.5,
         down_up_configs: list[tuple[int, int, tuple[int, int, int]]] | None = None,
         main_patch_size: tuple[int, int, int] = (1, 2, 2),
+        d_light: int | None = None,
     ) -> None:
         super().__init__()
         if down_up_configs is None:
@@ -709,11 +781,26 @@ class RayDer(nn.Module):
         self.width = width
         self.d_dynamic_state = d_dynamic_state
         self.dynamic_state_dropout = dynamic_state_dropout
+        self.d_light = d_light
         self.total_spatial_downsample = math.prod(ps[1] for _, _, ps in down_up_configs) * main_patch_size[1]
 
         self.backbone = Backbone(
-            width=width, depth=depth, d_cond=d_cond, down_up_configs=down_up_configs, main_patch_size=main_patch_size
+            width=width,
+            depth=depth,
+            d_cond=d_cond,
+            down_up_configs=down_up_configs,
+            main_patch_size=main_patch_size,
+            d_light=d_light,
         )
+
+        self.light_encoder = None
+        if d_light is not None:
+            self.light_encoder = nn.Sequential(
+                nn.Linear(5, d_light),
+                nn.SiLU(),
+                nn.Linear(d_light, d_light),
+                nn.SiLU(),
+            )
 
         std = 1e-4
         self.camera_tokens = nn.Embedding(1, width)
@@ -777,12 +864,15 @@ class RayDer(nn.Module):
         return create_block_mask(mask_mod, B=1, H=1, Q_LEN=L, KV_LEN=L, device=device)
 
     def _estimate_cameras(
-        self, x: Float[torch.Tensor, "b t h w c"]
+        self,
+        x: Float[torch.Tensor, "b t h w c"],
+        temporal_ranks: Int[torch.Tensor, "... t"] | None = None,
     ) -> tuple[Camera["b t"], Float[torch.Tensor, "b t d_state"]]:
         B, T, H, W, C = x.shape
         pos = repeat(make_axial_pos_3d(t=T, h=H, w=W, device=x.device), "(t h w) c -> b t h w c", b=B, t=T, h=H, w=W)
         pos = pos.clone()
-        pos[..., 0] = torch.argsort(torch.rand(B, T, device=x.device), dim=-1)[:, :, None, None].to(pos)
+        ranks = _prepare_temporal_ranks(B, T, x.device, temporal_ranks)
+        pos[..., 0] = ranks[:, :, None, None].to(pos)
         camera_tokens = self.camera_tokens(torch.zeros(B, T, dtype=torch.long, device=x.device))
         registers_pos = einops_reduce(pos, "b t h w c -> b t c", "mean")
 
@@ -815,6 +905,8 @@ class RayDer(nn.Module):
         state_target: Float[torch.Tensor, "b n_t d_state"],
         block_mask: BlockMask,
         drop_state: bool = False,
+        target_light: Float[torch.Tensor, "b n_t 5"] | None = None,
+        temporal_positions: Float[torch.Tensor, "... n_all"] | None = None,
     ) -> Float[torch.Tensor, "b n_t h w c"]:
         (B, N_in, H, W, C), dtype, device = x_in.shape, x_in.dtype, x_in.device
         _, N_t = camera_target.shape
@@ -826,7 +918,18 @@ class RayDer(nn.Module):
             make_axial_pos_3d(t=N_all, h=H, w=W, device=device), "(t h w) c -> b t h w c", b=B, t=N_all, h=H, w=W
         )
         pos = pos.clone()
-        pos[..., 0] = torch.argsort(torch.rand(B, N_all, device=device), dim=-1)[:, :, None, None].to(pos)
+        if temporal_positions is None:
+            temporal_positions = torch.argsort(torch.rand(B, N_all, device=device), dim=-1)
+        else:
+            temporal_positions = torch.as_tensor(temporal_positions, device=device)
+            if temporal_positions.ndim == 1:
+                temporal_positions = temporal_positions.unsqueeze(0).expand(B, -1)
+            if temporal_positions.shape != (B, N_all):
+                raise ValueError(
+                    f"Expected temporal_positions shape {(N_all,)} or {(B, N_all)}, "
+                    f"got {tuple(temporal_positions.shape)}."
+                )
+        pos[..., 0] = temporal_positions[:, :, None, None].to(pos)
         camera_tokens = self.nvs_tokens(torch.zeros(B, N_all, dtype=torch.long, device=device))
         registers_pos = einops_reduce(pos, "b t h w c -> b t c", "mean")
 
@@ -847,6 +950,17 @@ class RayDer(nn.Module):
         registers_cond_norm = self.view_type_embedding(
             torch.cat([torch.ones((B, N_in), **ekw), torch.full((B, N_t), 2, **ekw)], dim=1)
         ) + self.token_type_embedding(torch.full((B, N_all), 2, **ekw))
+        light_cond = registers_light_cond = None
+        if target_light is not None:
+            if self.light_encoder is None:
+                raise ValueError("This RayDer model was constructed without lighting conditioning.")
+            if target_light.shape != (B, N_t, 5):
+                raise ValueError(f"Expected target_light shape {(B, N_t, 5)}, got {tuple(target_light.shape)}.")
+            target_light_features = self.light_encoder(target_light.to(dtype=self.light_encoder[0].weight.dtype))
+            registers_light_cond = torch.cat(
+                [target_light_features.new_zeros(B, N_in, self.d_light), target_light_features], dim=1
+            )
+            light_cond = registers_light_cond[:, :, None, None]
         image_tokens, _ = self.backbone(
             x=torch.cat([torch.cat([x_in, x_in.new_zeros(B, N_t, H, W, C)], dim=1), pluecker], dim=-1),
             pos=pos,
@@ -855,13 +969,35 @@ class RayDer(nn.Module):
             global_block_mask=block_mask,
             cond_norm=cond_norm,
             registers_cond_norm=registers_cond_norm,
+            light_cond=light_cond,
+            registers_light_cond=registers_light_cond,
         )
         return image_tokens[:, -N_t:]
 
     @torch.no_grad()
     @torch.compile(dynamic=False, fullgraph=False)
-    def predict_cameras(self, x: Float[torch.Tensor, "b t h w c"]) -> Camera["b t"]:
-        return self._estimate_cameras(x=x)[0]
+    def predict_cameras(
+        self,
+        x: Float[torch.Tensor, "b t h w c"],
+        temporal_ranks: Int[torch.Tensor, "... t"] | None = None,
+    ) -> Camera["b t"]:
+        return self._estimate_cameras(x=x, temporal_ranks=temporal_ranks)[0]
+
+    @torch.no_grad()
+    @torch.compile(dynamic=False, fullgraph=False)
+    def predict_cameras_and_states(
+        self,
+        x: Float[torch.Tensor, "b t h w c"],
+        temporal_ranks: Int[torch.Tensor, "... t"] | None = None,
+    ) -> tuple[Camera["b t"], Float[torch.Tensor, "b t d_state"]]:
+        """Estimate cameras and nuisance states with optional temporal positions.
+
+        ``temporal_ranks`` may be a permutation shared by the batch with shape
+        ``(t,)`` or one permutation per sample with shape ``(b, t)``. The rank
+        is used as that view's temporal coordinate. By default, every sample
+        receives a random permutation.
+        """
+        return self._estimate_cameras(x=x, temporal_ranks=temporal_ranks)
 
     @torch.no_grad()
     @torch.compile(dynamic=False, fullgraph=False)
@@ -871,6 +1007,7 @@ class RayDer(nn.Module):
         cam_in: Camera["b n_in"],
         cam_target: Camera["b n_t"],
         state_target: Float[torch.Tensor, "b n_t d_state"] | None = None,
+        target_light: Float[torch.Tensor, "b n_t 5"] | None = None,
     ) -> Float[torch.Tensor, "b n_t h w c"]:
         B, N_in, H, W, C = x_in.shape
         N_t = cam_target.shape[1]
@@ -879,7 +1016,12 @@ class RayDer(nn.Module):
         if state_target is None:
             state_target = x_in.new_zeros(B, N_t, self.d_dynamic_state)
         return self._reconstruct(
-            x_in=x_in, camera_in=cam_in, camera_target=cam_target, state_target=state_target, block_mask=block_mask
+            x_in=x_in,
+            camera_in=cam_in,
+            camera_target=cam_target,
+            state_target=state_target,
+            block_mask=block_mask,
+            target_light=target_light,
         )
 
 

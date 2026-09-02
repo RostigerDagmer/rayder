@@ -138,6 +138,7 @@ celerybeat.pid
 .env
 .envrc
 .venv
+.torch-cache/
 env/
 venv/
 ENV/
@@ -205,3 +206,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+data
+tests
+outputs

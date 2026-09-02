@@ -70,8 +70,9 @@ model.requires_grad_(False)
 model.eval()
 ```
 
-The `RayDer` class exposes two high-level inference methods:
+The `RayDer` class exposes three high-level inference methods:
 - `predict_cameras(x)`: estimate camera parameters from a set of input views (trained for 8 views, but the models extrapolate quite well)
+- `predict_cameras_and_states(x, temporal_ranks=None)`: estimate cameras and per-view dynamic nuisance states, optionally using an explicit temporal positional-rank permutation for controlled experiments
 - `predict_views(x_in, cam_in, cam_target)`: synthesize novel views at target camera poses (trained for 1-7 input views, arbitrarily many output views)
 
 Cameras are represented as custom dataclasses that can be directly sliced/indexed as a whole.
@@ -90,6 +91,45 @@ Use `generate_video.py` to produce smooth view-interpolation videos from a set o
 python generate_video.py --image_dir /path/to/input/images --output output.mp4 --steps_per_pair 10 --fps 15
 ```
 A checkpoint will be downloaded automatically if not explicitly specified.
+
+### Batched OpenIllumination Compositing
+
+The OpenIllumination helper can stream many mixtures directly into an inference
+loop. A full 142-column weight matrix is accepted, but only lights used by at
+least one pattern are loaded. The selected OLAT basis is cropped/resized once in
+linear RGB and reused for every batch; no rendered images need to be written to
+disk.
+
+```python
+import numpy as np
+
+from rayder.open_illumination import OpenIlluminationOLAT
+
+dataset = OpenIlluminationOLAT("/path/to/openillumination", object_id=5)
+light_positions = dataset.load_light_positions()                 # (142, 3)
+light_directions = dataset.load_light_positions(normalize=True)  # unit vectors
+
+light_indices = [0, 8, 16, 32, 64, 112]
+weights = np.random.default_rng(0).dirichlet(np.ones(6), size=500)
+
+for images in dataset.iter_render_weight_batches(
+    weights,
+    cameras=["A1", "A2", "A3", "C1", "C4"],
+    light_indices=light_indices,
+    batch_size=4,
+    size=256,
+    center_crop=True,
+):
+    # images: float32 sRGB in [0, 1], shape (batch, camera, 256, 256, 3)
+    # x = torch.from_numpy(images).to(device).mul_(2).sub_(1)
+    ...
+```
+
+For small outputs, `render_weight_batch(...)` accepts the same arguments and
+returns the entire array. `download()` includes the dataset-wide
+`light_pos.npy` metadata by default and downloads up to eight files concurrently.
+Pass `max_workers=1` for serial downloads, or tune the worker count for your
+connection.
 
 ### Interactive Demo
 Launch the Gradio app for an interactive browser-based demo:
